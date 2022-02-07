@@ -293,6 +293,10 @@ public:
     return nullptr;
   }
 
+  bool preferCTTZLowering() {
+    return getTLI()->preferCTTZLowering();
+  }
+
   bool isLegalAddImmediate(int64_t imm) {
     return getTLI()->isLegalAddImmediate(imm);
   }

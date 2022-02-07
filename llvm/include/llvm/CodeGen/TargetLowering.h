@@ -2443,6 +2443,12 @@ public:
     return true;
   }
 
+  /// Return true if the target would benefit from recognizing a table-based
+  /// implementation of cttz.
+  virtual bool preferCTTZLowering() const {
+    return false;
+  }
+
   /// Return true if the specified immediate is legal add immediate, that is the
   /// target has add instructions which can add a register with the immediate
   /// without having to materialize the immediate into a register.

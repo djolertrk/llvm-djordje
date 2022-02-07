@@ -593,6 +593,10 @@ public:
   /// considered as "Slow".
   enum PopcntSupportKind { PSK_Software, PSK_SlowHardware, PSK_FastHardware };
 
+  /// Return true if the target would benefit from recognizing a table-based
+  /// implementation of cttz.
+  bool preferCTTZLowering() const;
+
   /// Return true if the specified immediate is legal add immediate, that
   /// is the target has add instructions which can add a register with the
   /// immediate without having to materialize the immediate into a register.
@@ -1529,6 +1533,7 @@ public:
       APInt &UndefElts2, APInt &UndefElts3,
       std::function<void(Instruction *, unsigned, APInt, APInt &)>
           SimplifyAndSetOp) = 0;
+  virtual bool preferCTTZLowering() = 0;
   virtual bool isLegalAddImmediate(int64_t Imm) = 0;
   virtual bool isLegalICmpImmediate(int64_t Imm) = 0;
   virtual bool isLegalAddressingMode(Type *Ty, GlobalValue *BaseGV,
@@ -1906,6 +1911,9 @@ public:
     return Impl.simplifyDemandedVectorEltsIntrinsic(
         IC, II, DemandedElts, UndefElts, UndefElts2, UndefElts3,
         SimplifyAndSetOp);
+  }
+  bool preferCTTZLowering() override {
+    return Impl.preferCTTZLowering();
   }
   bool isLegalAddImmediate(int64_t Imm) override {
     return Impl.isLegalAddImmediate(Imm);

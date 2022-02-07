@@ -22,6 +22,7 @@
 #include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
@@ -362,10 +363,172 @@ static bool tryToRecognizePopCount(Instruction &I) {
   return false;
 }
 
+static bool isCTTZTable(const ConstantDataArray &Table, uint64_t Mul,
+                        uint64_t Shift, uint64_t InputBits) {
+  unsigned Length = Table.getNumElements();
+  uint64_t IntWidth = InputBits / CHAR_BIT;
+  if (Length < InputBits || Length > InputBits * 2)
+    return false;
+
+  APInt Mask(InputBits, ((IntWidth << (InputBits - Shift)) - 1) << Shift);
+  unsigned Matched = 0;
+
+  for (unsigned i = 0; i < Length; i++) {
+    uint64_t Element = Table.getElementAsInteger(i);
+    if (Element < InputBits &&
+        (((Mul << Element) & Mask.getZExtValue()) >> Shift) == i)
+      Matched++;
+  }
+
+  return Matched == InputBits;
+}
+
+// Try to recognize table-based ctz implementation.
+// E.g., an example in C (for more cases please see the llvm/tests):
+// int f(unsigned x) {
+//    static const char table[32] =
+//      {0, 1, 28, 2, 29, 14, 24, 3, 30,
+//       22, 20, 15, 25, 17, 4, 8, 31, 27,
+//       13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9};
+//    return table[((unsigned)((x & -x) * 0x077CB531U)) >> 27];
+// }
+// this can be lowered to `cttz` instruction.
+// There is also a special case when the element is 0.
+//
+// Here are some examples or IR for AARCH64 target:
+//
+// CASE 1:
+// %sub = sub i32 0, %x
+// %and = and i32 %sub, %x
+// %mul = mul i32 %and, 125613361
+// %shr = lshr i32 %mul, 27
+// %idxprom = zext i32 %shr to i64
+// %arrayidx = getelementptr inbounds [32 x i8], [32 x i8]* @ctz1.table, i64 0,
+// i64 %idxprom %0 = load i8, i8* %arrayidx, align 1, !tbaa !8
+//
+// CASE 2:
+// %sub = sub i32 0, %x
+// %and = and i32 %sub, %x
+// %mul = mul i32 %and, 72416175
+// %shr = lshr i32 %mul, 26
+// %idxprom = zext i32 %shr to i64
+// %arrayidx = getelementptr inbounds [64 x i16], [64 x i16]* @ctz2.table, i64
+// 0, i64 %idxprom %0 = load i16, i16* %arrayidx, align 2, !tbaa !8
+//
+// CASE 3:
+// %sub = sub i32 0, %x
+// %and = and i32 %sub, %x
+// %mul = mul i32 %and, 81224991
+// %shr = lshr i32 %mul, 27
+// %idxprom = zext i32 %shr to i64
+// %arrayidx = getelementptr inbounds [32 x i32], [32 x i32]* @ctz3.table, i64
+// 0, i64 %idxprom %0 = load i32, i32* %arrayidx, align 4, !tbaa !8
+//
+// CASE 4:
+// %sub = sub i64 0, %x
+// %and = and i64 %sub, %x
+// %mul = mul i64 %and, 283881067100198605
+// %shr = lshr i64 %mul, 58
+// %arrayidx = getelementptr inbounds [64 x i8], [64 x i8]* @table, i64 0, i64
+// %shr %0 = load i8, i8* %arrayidx, align 1, !tbaa !8
+//
+// All this can be lowered to @llvm.cttz.i32/64 intrinsic.
+static bool tryToRecognizeTableBasedCttz(Instruction &I) {
+  LoadInst *LI = dyn_cast<LoadInst>(&I);
+  if (!LI)
+    return false;
+
+  Type *ElType = LI->getPointerOperandType()->getPointerElementType();
+  if (!ElType->isIntegerTy())
+    return false;
+
+  GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand());
+  if (!GEP || !GEP->isInBounds() || GEP->getNumIndices() != 2)
+    return false;
+
+  Type *GEPPointeeType = GEP->getPointerOperandType()->getPointerElementType();
+  if (!GEPPointeeType->isArrayTy())
+    return false;
+
+  uint64_t ArraySize = GEPPointeeType->getArrayNumElements();
+  if (ArraySize != 32 && ArraySize != 64)
+    return false;
+
+  User *GEPUser = dyn_cast<User>(GEP->getPointerOperand());
+  if (!GEPUser)
+    return false;
+
+  ConstantDataArray *ConstData =
+      dyn_cast<ConstantDataArray>(GEPUser->getOperand(0));
+  if (!ConstData)
+    return false;
+
+  Value *Idx1 = GEP->idx_begin()->get();
+  Constant *Zero = dyn_cast<Constant>(Idx1);
+  if (!Zero || !Zero->isZeroValue())
+    return false;
+
+  Value *Idx2 = std::next(GEP->idx_begin())->get();
+
+  bool ConstIsWide = !match(Idx2, m_ZExt(m_Value()));
+
+  Value *X1;
+  uint64_t MulConst, ShiftConst;
+  // FIXME: AArch64 has i64 type for the GEP index, so this match will
+  // probably fail for other targets.
+  if (!match(Idx2,
+             m_ZExtOrSelf(m_LShr(
+                 m_ZExtOrSelf(m_Mul(m_c_And(m_Neg(m_Value(X1)), m_Deferred(X1)),
+                                    m_ConstantInt(MulConst))),
+                 m_ConstantInt(ShiftConst)))))
+    return false;
+
+  unsigned InputBits = ConstIsWide ? 64 : 32;
+
+  // Shift should extract top 5..7 bits.
+  if (ShiftConst < InputBits - 7 || ShiftConst > InputBits - 5)
+    return false;
+
+  Type *XType = X1->getType();
+  if (!XType->isIntegerTy(InputBits))
+    return false;
+
+  if (!isCTTZTable(*ConstData, MulConst, ShiftConst, InputBits))
+    return false;
+
+  auto ZeroTableElem = ConstData->getElementAsInteger(0);
+  bool DefinedForZero = ZeroTableElem == InputBits;
+
+  IRBuilder<> B(LI);
+  ConstantInt *BoolConst = B.getInt1(!DefinedForZero);
+  auto Cttz = B.CreateIntrinsic(Intrinsic::cttz, {XType}, {X1, BoolConst});
+  Value *ZExtOrTrunc = nullptr;
+
+  if (DefinedForZero) {
+    ZExtOrTrunc = B.CreateZExtOrTrunc(Cttz, ElType);
+  } else {
+    // If the value in elem 0 isn't the same as InputBits, we still want to
+    // produce the value from the table.
+    auto Cmp = B.CreateICmpEQ(X1, ConstantInt::get(XType, 0));
+    auto Select =
+        B.CreateSelect(Cmp, ConstantInt::get(XType, ZeroTableElem), Cttz);
+
+    // NOTE: If the table[0] is 0, but the cttz(0) is defined by the Target
+    // it should be handled as: `cttz(x) & (typeSize - 1)`.
+
+    ZExtOrTrunc = B.CreateZExtOrTrunc(Select, ElType);
+  }
+
+  LI->replaceAllUsesWith(ZExtOrTrunc);
+
+  return true;
+}
+
 /// This is the entry point for folds that could be implemented in regular
 /// InstCombine, but they are separated because they are not expected to
 /// occur frequently and/or have more than a constant-length pattern match.
-static bool foldUnusualPatterns(Function &F, DominatorTree &DT) {
+static bool foldUnusualPatterns(Function &F, DominatorTree &DT,
+    TargetTransformInfo &TTI) {
   bool MadeChange = false;
   for (BasicBlock &BB : F) {
     // Ignore unreachable basic blocks.
@@ -381,6 +544,8 @@ static bool foldUnusualPatterns(Function &F, DominatorTree &DT) {
       MadeChange |= foldAnyOrAllBitsSet(I);
       MadeChange |= foldGuardedFunnelShift(I, DT);
       MadeChange |= tryToRecognizePopCount(I);
+      if (TTI.preferCTTZLowering())
+        MadeChange |= tryToRecognizeTableBasedCttz(I);
     }
   }
 
@@ -395,12 +560,12 @@ static bool foldUnusualPatterns(Function &F, DominatorTree &DT) {
 /// This is the entry point for all transforms. Pass manager differences are
 /// handled in the callers of this function.
 static bool runImpl(Function &F, AssumptionCache &AC, TargetLibraryInfo &TLI,
-                    DominatorTree &DT) {
+                    DominatorTree &DT, TargetTransformInfo &TTI) {
   bool MadeChange = false;
   const DataLayout &DL = F.getParent()->getDataLayout();
   TruncInstCombine TIC(AC, TLI, DL, DT);
   MadeChange |= TIC.run(F);
-  MadeChange |= foldUnusualPatterns(F, DT);
+  MadeChange |= foldUnusualPatterns(F, DT, TTI);
   return MadeChange;
 }
 
@@ -409,6 +574,7 @@ void AggressiveInstCombinerLegacyPass::getAnalysisUsage(
   AU.setPreservesCFG();
   AU.addRequired<AssumptionCacheTracker>();
   AU.addRequired<DominatorTreeWrapperPass>();
+  AU.addRequired<TargetTransformInfoWrapperPass>();
   AU.addRequired<TargetLibraryInfoWrapperPass>();
   AU.addPreserved<AAResultsWrapperPass>();
   AU.addPreserved<BasicAAWrapperPass>();
@@ -420,7 +586,8 @@ bool AggressiveInstCombinerLegacyPass::runOnFunction(Function &F) {
   auto &AC = getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
   auto &TLI = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(F);
   auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-  return runImpl(F, AC, TLI, DT);
+  auto &TTI = getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+  return runImpl(F, AC, TLI, DT, TTI);
 }
 
 PreservedAnalyses AggressiveInstCombinePass::run(Function &F,
@@ -428,7 +595,8 @@ PreservedAnalyses AggressiveInstCombinePass::run(Function &F,
   auto &AC = AM.getResult<AssumptionAnalysis>(F);
   auto &TLI = AM.getResult<TargetLibraryAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
-  if (!runImpl(F, AC, TLI, DT)) {
+  auto &TTI = AM.getResult<TargetIRAnalysis>(F);
+  if (!runImpl(F, AC, TLI, DT, TTI)) {
     // No changes, all analyses are preserved.
     return PreservedAnalyses::all();
   }
@@ -444,6 +612,7 @@ INITIALIZE_PASS_BEGIN(AggressiveInstCombinerLegacyPass,
                       "Combine pattern based expressions", false, false)
 INITIALIZE_PASS_DEPENDENCY(AssumptionCacheTracker)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
 INITIALIZE_PASS_END(AggressiveInstCombinerLegacyPass, "aggressive-instcombine",
                     "Combine pattern based expressions", false, false)

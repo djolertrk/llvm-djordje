@@ -200,6 +200,8 @@ public:
   void getPeelingPreferences(Loop *, ScalarEvolution &,
                              TTI::PeelingPreferences &) const {}
 
+  bool preferCTTZLowering() const { return false; }
+
   bool isLegalAddImmediate(int64_t Imm) const { return false; }
 
   bool isLegalICmpImmediate(int64_t Imm) const { return false; }

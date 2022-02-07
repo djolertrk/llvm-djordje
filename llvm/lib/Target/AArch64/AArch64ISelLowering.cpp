@@ -12827,6 +12827,10 @@ LLT AArch64TargetLowering::getOptimalMemOpLLT(
   return LLT();
 }
 
+bool AArch64TargetLowering::preferCTTZLowering() const {
+  return true;
+}
+
 // 12-bit optionally shifted immediates are legal for adds.
 bool AArch64TargetLowering::isLegalAddImmediate(int64_t Immed) const {
   if (Immed == std::numeric_limits<int64_t>::min()) {
