@@ -2526,6 +2526,13 @@ public:
     getCanonicalDecl()->FunctionDeclBits.IsMultiVersion = V;
   }
 
+  bool isFriend() const {
+    return getCanonicalDecl()->FunctionDeclBits.IsFriend;
+  }
+  void setIsFriend(bool V = true) {
+    getCanonicalDecl()->FunctionDeclBits.IsFriend = V;
+  }
+
   // Sets that this is a constrained friend where the constraint refers to an
   // enclosing template.
   void setFriendConstraintRefersToEnclosingTemplate(bool V = true) {

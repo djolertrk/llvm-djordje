@@ -9649,6 +9649,10 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
     bool isVirtual = D.getDeclSpec().isVirtualSpecified();
     bool hasExplicit = D.getDeclSpec().hasExplicitSpecifier();
     isFriend = D.getDeclSpec().isFriendSpecified();
+
+    if (isFriend)
+      NewFD->setIsFriend();
+
     if (isFriend && !isInline && D.isFunctionDefinition()) {
       // Pre-C++20 [class.friend]p5
       //   A function can be defined in a friend declaration of a

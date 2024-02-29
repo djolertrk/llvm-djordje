@@ -1675,10 +1675,13 @@ class DeclContext {
     // Indicates this function is a constrained friend, where the constraint
     // refers to an enclosing template for hte purposes of [temp.friend]p9.
     uint64_t FriendConstraintRefersToEnclosingTemplate : 1;
+
+    // Indicates this function is a friend.
+    uint64_t IsFriend : 1;
   };
 
   /// Number of non-inherited bits in FunctionDeclBitfields.
-  enum { NumFunctionDeclBits = 29 };
+  enum { NumFunctionDeclBits = 30 };
 
   /// Stores the bits used by CXXConstructorDecl. If modified
   /// NumCXXConstructorDeclBits and the accessor
@@ -1880,8 +1883,8 @@ protected:
                   "OMPDeclareReductionDeclBitfields is larger than 8 bytes!");
     static_assert(sizeof(FunctionDeclBitfields) <= 8,
                   "FunctionDeclBitfields is larger than 8 bytes!");
-    static_assert(sizeof(CXXConstructorDeclBitfields) <= 8,
-                  "CXXConstructorDeclBitfields is larger than 8 bytes!");
+    static_assert(sizeof(CXXConstructorDeclBitfields) <= 16,
+                  "CXXConstructorDeclBitfields is larger than 16 bytes!");
     static_assert(sizeof(ObjCMethodDeclBitfields) <= 8,
                   "ObjCMethodDeclBitfields is larger than 8 bytes!");
     static_assert(sizeof(ObjCContainerDeclBitfields) <= 8,
